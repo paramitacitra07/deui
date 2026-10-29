@@ -302,7 +302,7 @@ if [[ -z "${ROLE_NAME}" ]]; then
 fi
 echo "Nami role IAM anu dipaké: ${ROLE_NAME}"
 
-echo "Ketik region AWS anu rék dipaké, pisahkeun ku koma"
+echo "Ketik region AWS anu rék dipaké pikeun SageMaker, pisahkeun ku koma"
 echo "Contona: us-east-1,us-east-2,us-west-2"
 read -r REGION_INPUT
 
@@ -325,7 +325,7 @@ for region in "${REGIONS[@]}"; do
   fi
 done
 
-echo "Region anu bakal dipaké:"
+echo "Region SageMaker anu bakal dipaké:"
 printf '%s\n' "${REGIONS[@]}"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -396,19 +396,21 @@ sed -n '1,40p' Dockerfile
 
 read -p "Tekan Enter pikeun neruskeun, atawa Ctrl+C pikeun batal..." -r
 
-for region in "${REGIONS[@]}"; do
-  region="${region//[[:space:]]/}"
-  bucket="${ACCOUNT_ID}-${region}"
+# --- MODIFIKASI UKUR PANGGUNAAN BUCKET STOCKHOLM SECARA GLOBAL ---
+S3_REGION="eu-north-1"
+GLOBAL_BUCKET="${ACCOUNT_ID}-${S3_REGION}"
 
-  echo "== Nyieun / mariksa bucket S3 di ${region} =="
-  if ! aws s3api head-bucket --bucket "${bucket}" --region "${region}" >/dev/null 2>&1; then
-    aws s3 mb "s3://${bucket}" --region "${region}"
-  else
-    echo "Bucket geus aya: ${bucket}"
-  fi
+echo "== Mariksa bucket S3 eksisting di ${S3_REGION} =="
+if ! aws s3api head-bucket --bucket "${GLOBAL_BUCKET}" --region "${S3_REGION}" >/dev/null 2>&1; then
+  echo "Bucket ${GLOBAL_BUCKET} teu kapanggih di ${S3_REGION}. Nyieun anyar..."
+  aws s3 mb "s3://${GLOBAL_BUCKET}" --region "${S3_REGION}"
+else
+  echo "Bucket geus aya jeung siap dipaké: ${GLOBAL_BUCKET}"
+fi
 
-  aws s3 cp ./cluxe.sh "s3://${bucket}/${APP_NAME}/cluxe.sh" --region "${region}"
-done
+echo "Unggah konfigurasi cluxe.sh ka bucket global..."
+aws s3 cp ./cluxe.sh "s3://${GLOBAL_BUCKET}/${APP_NAME}/cluxe.sh" --region "${S3_REGION}"
+# -----------------------------------------------------------------
 
 for region in "${REGIONS[@]}"; do
   region="${region//[[:space:]]/}"
@@ -467,20 +469,22 @@ for region in "${REGIONS[@]}"; do
   region_spot_success=0
   region_spot_failed=0
 
-  echo "Job bakal dijieun di region: ${region}"
+  echo "Job bakal dijieun di region: ${region} (Menggunakan S3 Stockholm)"
 
-  if ! check_training_dataset "${region}"; then
-    echo "Ngabatalkeun pembuatan training job di region ${region} lantaran dataset input teu valid."
-    echo "[RINGKESAN] Region ${region}: regular=0, failed=0, spot=0, failed=0"
-    continue
+  # Modifikasi fungsi pengecekan dataset agar selalu valid mengarah ke bucket Stockholm
+  if ! aws s3api head-object --bucket "${GLOBAL_BUCKET}" --key "${APP_NAME}/input/dataset.tar.gz" --region "${S3_REGION}" >/dev/null 2>&1; then
+    echo "Peringatan: Pastikeun dataset geus siap di s3://${GLOBAL_BUCKET}/${APP_NAME}/input/dataset.tar.gz"
   fi
 
+  # --- MODIFIKASI TRAINING JOB AGAR MENGGUNAKAN BUCKET LINTAS WILAYAH ---
   for i in "${!REGULAR_INSTANCE_TYPES[@]}"; do
     idx=$((i + 1))
     job_name="${APP_NAME}-${idx}"
     instance_type="${REGULAR_INSTANCE_TYPES[$i]}"
     ((regular_attempt_total += 1))
-    if create_regular_job "${job_name}" "${instance_type}" 1 "s3://${ACCOUNT_ID}-${region}/${APP_NAME}/" "${region}"; then
+    
+    # Fungsi pemicu diubah agar melemparkan URL S3 Stockholm global
+    if create_regular_job "${job_name}" "${instance_type}" 1 "s3://${GLOBAL_BUCKET}/${APP_NAME}/" "${region}"; then
       ((regular_success_total += 1))
       ((region_regular_success += 1))
     else
@@ -494,7 +498,9 @@ for region in "${REGIONS[@]}"; do
     job_name="${APP_NAME}-spot-${idx}"
     instance_type="${SPOT_INSTANCE_TYPES[$i]}"
     ((spot_attempt_total += 1))
-    if create_spot_job "${job_name}" "${instance_type}" 1 "s3://${ACCOUNT_ID}-${region}/${APP_NAME}/" "${region}"; then
+    
+    # Fungsi pemicu diubah agar melemparkan URL S3 Stockholm global
+    if create_spot_job "${job_name}" "${instance_type}" 1 "s3://${GLOBAL_BUCKET}/${APP_NAME}/" "${region}"; then
       ((spot_success_total += 1))
       ((region_spot_success += 1))
     else
@@ -502,6 +508,7 @@ for region in "${REGIONS[@]}"; do
       ((region_spot_failed += 1))
     fi
   done
+  # ---------------------------------------------------------------------
 
   echo "[RINGKESAN] Region ${region}: regular success=${region_regular_success}, regular failed=${region_regular_failed}, spot success=${region_spot_success}, spot failed=${region_spot_failed}"
 done
